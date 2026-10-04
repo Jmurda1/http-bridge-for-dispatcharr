@@ -24,9 +24,13 @@ class H2HLSBridge:
         self.channels = {}
         self.start_error = None
 
-        # Live HLS playlists are cached for three seconds.
+        # Fresh playlists are cached for three seconds.
         self.playlist_cache = {}
         self.playlist_cache_ttl = 3
+
+        # Prevent several simultaneous requests from refreshing
+        # the same playlist at the same time.
+        self.playlist_locks = {}
 
     @property
     def host(self):
@@ -36,7 +40,14 @@ class H2HLSBridge:
 
     @property
     def port(self):
-        return int(self.settings.get("listen_port", 8765))
+        try:
+            return int(
+                self.settings.get("listen_port", 8765)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "listen_port must be a valid integer"
+            ) from exc
 
     def load_channels(self):
         raw_channels = self.settings.get("channels", "[]")
@@ -45,7 +56,9 @@ class H2HLSBridge:
             channel_data = raw_channels
         else:
             try:
-                channel_data = json.loads(raw_channels or "[]")
+                channel_data = json.loads(
+                    raw_channels or "[]"
+                )
             except json.JSONDecodeError as exc:
                 raise ValueError(
                     f"Invalid Protected channels JSON: {exc}"
@@ -64,7 +77,10 @@ class H2HLSBridge:
                     "Each channel must be a JSON object"
                 )
 
-            channel_id = str(item.get("id", "")).strip()
+            channel_id = str(
+                item.get("id", "")
+            ).strip()
+
             upstream_url = str(
                 item.get("upstream_url", "")
             ).strip()
@@ -96,7 +112,8 @@ class H2HLSBridge:
                 or not parsed.netloc
             ):
                 raise ValueError(
-                    f"Invalid upstream_url for channel {channel_id}"
+                    f"Invalid upstream_url for channel "
+                    f"{channel_id}"
                 )
 
             loaded[channel_id] = {
@@ -124,7 +141,6 @@ class H2HLSBridge:
 
         self.channels = loaded
 
-        # Remove cache entries for deleted channels.
         self.playlist_cache = {
             channel_id: cached
             for channel_id, cached
@@ -183,6 +199,9 @@ class H2HLSBridge:
         self.runner = None
         self.site = None
 
+        self.playlist_cache.clear()
+        self.playlist_locks.clear()
+
         self.logger.info(
             "H2 HLS bridge stopped"
         )
@@ -225,6 +244,10 @@ class H2HLSBridge:
                 read=30,
                 write=30,
                 pool=30,
+            ),
+            limits=httpx.Limits(
+                max_connections=50,
+                max_keepalive_connections=20,
             ),
         )
 
@@ -296,7 +319,13 @@ class H2HLSBridge:
             "User-Agent": channel.get(
                 "user_agent",
                 "Mozilla/5.0",
-            )
+            ),
+            "Accept": (
+                "application/vnd.apple.mpegurl,"
+                "application/x-mpegURL,"
+                "application/octet-stream,"
+                "*/*"
+            ),
         }
 
         referer = channel.get("referer", "")
@@ -311,7 +340,8 @@ class H2HLSBridge:
         return headers
 
     def add_allowed_host(self, url, channel):
-        host = urlparse(url).netloc.lower()
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
 
         if host:
             channel["allowed_hosts"].add(host)
@@ -327,7 +357,18 @@ class H2HLSBridge:
         )
 
     async def fetch(self, url, channel):
+        self.logger.info(
+            "Proxy fetch requested: %s; allowed_hosts=%s",
+            url,
+            sorted(channel["allowed_hosts"]),
+        )
+
         if not self.is_allowed_url(url, channel):
+            self.logger.error(
+                "Blocked upstream URL: %s",
+                url,
+            )
+
             raise web.HTTPForbidden(
                 text="Upstream host is not allowed"
             )
@@ -350,6 +391,9 @@ class H2HLSBridge:
                     )
                 )
 
+                if not retry_after:
+                    retry_after = "60"
+
                 self.logger.warning(
                     "Upstream rate-limited %s; "
                     "Retry-After=%s",
@@ -360,8 +404,8 @@ class H2HLSBridge:
                 raise web.HTTPTooManyRequests(
                     text="Upstream rate limit reached",
                     headers={
-                        "Retry-After": (
-                            retry_after or "60"
+                        "Retry-After": str(
+                            retry_after
                         ),
                     },
                 ) from exc
@@ -436,23 +480,21 @@ class H2HLSBridge:
                         channel,
                     )
 
-                    local_url = self.local_resource_url(
-                        channel_id,
-                        original_url,
-                    )
-
                     return (
                         match.group(1)
-                        + local_url
+                        + self.local_resource_url(
+                            channel_id,
+                            original_url,
+                        )
                         + match.group(3)
                     )
 
-                rewritten = uri_pattern.sub(
-                    replace_uri,
-                    original_line,
+                output.append(
+                    uri_pattern.sub(
+                        replace_uri,
+                        original_line,
+                    )
                 )
-
-                output.append(rewritten)
                 continue
 
             absolute_url = urljoin(
@@ -501,24 +543,37 @@ class H2HLSBridge:
             return None
 
         timestamp, body = cached
+        age = time.monotonic() - timestamp
 
-        if (
-            time.monotonic() - timestamp
-            > self.playlist_cache_ttl
-        ):
-            self.playlist_cache.pop(
-                channel_id,
-                None,
-            )
+        if age > self.playlist_cache_ttl:
             return None
 
         return body
+
+    def get_stale_playlist(self, channel_id):
+        cached = self.playlist_cache.get(
+            channel_id
+        )
+
+        if not cached:
+            return None
+
+        return cached[1]
 
     def cache_playlist(self, channel_id, body):
         self.playlist_cache[channel_id] = (
             time.monotonic(),
             body,
         )
+
+    def get_playlist_lock(self, channel_id):
+        lock = self.playlist_locks.get(channel_id)
+
+        if lock is None:
+            lock = asyncio.Lock()
+            self.playlist_locks[channel_id] = lock
+
+        return lock
 
     async def health(self, request):
         return web.json_response(
@@ -544,6 +599,11 @@ class H2HLSBridge:
         )
 
         if cached_body is not None:
+            self.logger.info(
+                "Serving fresh cached playlist for %s",
+                channel_id,
+            )
+
             return web.Response(
                 text=cached_body,
                 content_type=(
@@ -555,33 +615,155 @@ class H2HLSBridge:
                 },
             )
 
-        response = await self.fetch(
-            channel["upstream_url"],
-            channel,
-        )
+        lock = self.get_playlist_lock(channel_id)
 
-        body = self.rewrite_playlist(
-            response.text,
-            str(response.url),
-            channel_id,
-            channel,
-        )
+        async with lock:
+            cached_body = self.get_cached_playlist(
+                channel_id
+            )
 
-        self.cache_playlist(
-            channel_id,
-            body,
-        )
+            if cached_body is not None:
+                return web.Response(
+                    text=cached_body,
+                    content_type=(
+                        "application/vnd.apple.mpegurl"
+                    ),
+                    headers={
+                        "Cache-Control": "no-store",
+                        "Access-Control-Allow-Origin": "*",
+                    },
+                )
 
-        return web.Response(
-            text=body,
-            content_type=(
-                "application/vnd.apple.mpegurl"
-            ),
-            headers={
-                "Cache-Control": "no-store",
-                "Access-Control-Allow-Origin": "*",
-            },
-        )
+            self.logger.info(
+                "Fetching upstream playlist for %s: %s",
+                channel_id,
+                channel["upstream_url"],
+            )
+
+            try:
+                response = await self.fetch(
+                    channel["upstream_url"],
+                    channel,
+                )
+
+                body = self.rewrite_playlist(
+                    response.text,
+                    str(response.url),
+                    channel_id,
+                    channel,
+                )
+
+                self.cache_playlist(
+                    channel_id,
+                    body,
+                )
+
+                self.logger.info(
+                    "Playlist fetched successfully for %s; "
+                    "status=%s; bytes=%s",
+                    channel_id,
+                    response.status_code,
+                    len(body.encode("utf-8")),
+                )
+
+                return web.Response(
+                    text=body,
+                    content_type=(
+                        "application/vnd.apple.mpegurl"
+                    ),
+                    headers={
+                        "Cache-Control": "no-store",
+                        "Access-Control-Allow-Origin": "*",
+                    },
+                )
+
+            except web.HTTPTooManyRequests as exc:
+                stale_body = self.get_stale_playlist(
+                    channel_id
+                )
+
+                if stale_body is not None:
+                    self.logger.warning(
+                        "Upstream rate-limited %s; "
+                        "serving stale cached playlist",
+                        channel_id,
+                    )
+
+                    return web.Response(
+                        text=stale_body,
+                        content_type=(
+                            "application/vnd.apple.mpegurl"
+                        ),
+                        headers={
+                            "Cache-Control": "no-store",
+                            "X-Playlist-Stale": "1",
+                            "Access-Control-Allow-Origin": "*",
+                        },
+                    )
+
+                raise exc
+
+            except (
+                web.HTTPBadGateway,
+                web.HTTPGatewayTimeout,
+            ) as exc:
+                stale_body = self.get_stale_playlist(
+                    channel_id
+                )
+
+                if stale_body is not None:
+                    self.logger.warning(
+                        "Upstream unavailable for %s; "
+                        "serving stale cached playlist",
+                        channel_id,
+                    )
+
+                    return web.Response(
+                        text=stale_body,
+                        content_type=(
+                            "application/vnd.apple.mpegurl"
+                        ),
+                        headers={
+                            "Cache-Control": "no-store",
+                            "X-Playlist-Stale": "1",
+                            "Access-Control-Allow-Origin": "*",
+                        },
+                    )
+
+                raise exc
+
+            except Exception:
+                self.logger.exception(
+                    "Unexpected playlist error for %s",
+                    channel_id,
+                )
+
+                stale_body = self.get_stale_playlist(
+                    channel_id
+                )
+
+                if stale_body is not None:
+                    self.logger.warning(
+                        "Serving stale playlist after "
+                        "unexpected error for %s",
+                        channel_id,
+                    )
+
+                    return web.Response(
+                        text=stale_body,
+                        content_type=(
+                            "application/vnd.apple.mpegurl"
+                        ),
+                        headers={
+                            "Cache-Control": "no-store",
+                            "X-Playlist-Stale": "1",
+                            "Access-Control-Allow-Origin": "*",
+                        },
+                    )
+
+                raise web.HTTPBadGateway(
+                    text="Unexpected playlist proxy error"
+                )
 
     async def resource(self, request):
         channel_id, channel = (
@@ -644,7 +826,7 @@ class H2HLSBridge:
 
 class Plugin:
     name = "HTTP/2 HLS Bridge"
-    version = "2.0.1"
+    version = "2.0.2"
     description = (
         "Per-channel HLS proxy for streams requiring "
         "custom Referer, Origin, and User-Agent headers."
