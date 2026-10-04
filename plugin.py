@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import threading
+import time
 from urllib.parse import quote, urljoin, urlparse
 
 import httpx
@@ -22,6 +23,10 @@ class H2HLSBridge:
 
         self.channels = {}
         self.start_error = None
+
+        # Live HLS playlists are cached for three seconds.
+        self.playlist_cache = {}
+        self.playlist_cache_ttl = 3
 
     @property
     def host(self):
@@ -75,7 +80,8 @@ class H2HLSBridge:
             ):
                 raise ValueError(
                     f"Invalid channel id: {channel_id}. "
-                    "Use only letters, numbers, hyphens, and underscores."
+                    "Use only letters, numbers, hyphens, "
+                    "and underscores."
                 )
 
             if channel_id in loaded:
@@ -106,7 +112,10 @@ class H2HLSBridge:
                     item.get("origin", "")
                 ).strip(),
                 "user_agent": str(
-                    item.get("user_agent", "Mozilla/5.0")
+                    item.get(
+                        "user_agent",
+                        "Mozilla/5.0",
+                    )
                 ).strip(),
                 "allowed_hosts": {
                     parsed.netloc.lower()
@@ -114,6 +123,14 @@ class H2HLSBridge:
             }
 
         self.channels = loaded
+
+        # Remove cache entries for deleted channels.
+        self.playlist_cache = {
+            channel_id: cached
+            for channel_id, cached
+            in self.playlist_cache.items()
+            if channel_id in self.channels
+        }
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -166,7 +183,9 @@ class H2HLSBridge:
         self.runner = None
         self.site = None
 
-        self.logger.info("H2 HLS bridge stopped")
+        self.logger.info(
+            "H2 HLS bridge stopped"
+        )
 
     def _run_thread(self):
         self.loop = asyncio.new_event_loop()
@@ -248,12 +267,13 @@ class H2HLSBridge:
     async def _shutdown(self):
         if self.client:
             await self.client.aclose()
-            self.client = None
+
+        self.client = None
 
         if self.runner:
             await self.runner.cleanup()
-            self.runner = None
 
+        self.runner = None
         self.site = None
 
     def channel_from_request(self, request):
@@ -317,19 +337,43 @@ class H2HLSBridge:
                 url,
                 headers=self.request_headers(channel),
             )
+
             response.raise_for_status()
 
         except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+
+            if status == 429:
+                retry_after = (
+                    exc.response.headers.get(
+                        "retry-after"
+                    )
+                )
+
+                self.logger.warning(
+                    "Upstream rate-limited %s; "
+                    "Retry-After=%s",
+                    url,
+                    retry_after,
+                )
+
+                raise web.HTTPTooManyRequests(
+                    text="Upstream rate limit reached",
+                    headers={
+                        "Retry-After": (
+                            retry_after or "60"
+                        ),
+                    },
+                ) from exc
+
             self.logger.error(
                 "Upstream HTTP %s for %s",
-                exc.response.status_code,
+                status,
                 url,
             )
+
             raise web.HTTPBadGateway(
-                text=(
-                    "Upstream returned HTTP "
-                    f"{exc.response.status_code}"
-                )
+                text=f"Upstream returned HTTP {status}"
             ) from exc
 
         except httpx.HTTPError as exc:
@@ -338,6 +382,7 @@ class H2HLSBridge:
                 url,
                 exc,
             )
+
             raise web.HTTPBadGateway(
                 text="Unable to fetch upstream stream"
             ) from exc
@@ -379,14 +424,13 @@ class H2HLSBridge:
                 continue
 
             if line.startswith("#"):
+
                 def replace_uri(match):
                     original_url = urljoin(
                         playlist_url,
                         match.group(2),
                     )
 
-                    # The upstream playlist defines these URLs,
-                    # so remember their hosts for later requests.
                     self.add_allowed_host(
                         original_url,
                         channel,
@@ -416,8 +460,6 @@ class H2HLSBridge:
                 line,
             )
 
-            # Segment and nested-playlist hosts are defined by the
-            # upstream playlist.
             self.add_allowed_host(
                 absolute_url,
                 channel,
@@ -450,11 +492,42 @@ class H2HLSBridge:
             or ".m3u8" in target_url.lower()
         )
 
+    def get_cached_playlist(self, channel_id):
+        cached = self.playlist_cache.get(
+            channel_id
+        )
+
+        if not cached:
+            return None
+
+        timestamp, body = cached
+
+        if (
+            time.monotonic() - timestamp
+            > self.playlist_cache_ttl
+        ):
+            self.playlist_cache.pop(
+                channel_id,
+                None,
+            )
+            return None
+
+        return body
+
+    def cache_playlist(self, channel_id, body):
+        self.playlist_cache[channel_id] = (
+            time.monotonic(),
+            body,
+        )
+
     async def health(self, request):
         return web.json_response(
             {
                 "status": "ok",
                 "http2_upstream": True,
+                "playlist_cache_ttl": (
+                    self.playlist_cache_ttl
+                ),
                 "channels": sorted(
                     self.channels.keys()
                 ),
@@ -466,6 +539,22 @@ class H2HLSBridge:
             self.channel_from_request(request)
         )
 
+        cached_body = self.get_cached_playlist(
+            channel_id
+        )
+
+        if cached_body is not None:
+            return web.Response(
+                text=cached_body,
+                content_type=(
+                    "application/vnd.apple.mpegurl"
+                ),
+                headers={
+                    "Cache-Control": "no-store",
+                    "Access-Control-Allow-Origin": "*",
+                },
+            )
+
         response = await self.fetch(
             channel["upstream_url"],
             channel,
@@ -476,6 +565,11 @@ class H2HLSBridge:
             str(response.url),
             channel_id,
             channel,
+        )
+
+        self.cache_playlist(
+            channel_id,
+            body,
         )
 
         return web.Response(
@@ -629,8 +723,9 @@ class Plugin:
             return {
                 "status": "ok",
                 "message": (
-                    "Bridge started. Protected channel URLs "
-                    "use /hls/<channel_id>/playlist.m3u8"
+                    "Bridge started. Protected channel "
+                    "URLs use "
+                    "/hls/<channel_id>/playlist.m3u8"
                 ),
             }
 
