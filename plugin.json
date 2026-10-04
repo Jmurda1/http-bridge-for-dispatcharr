@@ -1,0 +1,58 @@
+{
+  "name": "HTTP/2 HLS Bridge",
+  "version": "1.0.0",
+  "description": "Proxies HLS streams over HTTP/2 with custom Referer and Origin headers.",
+  "author": "Local",
+  "source_type": "github",
+  "source_url": "https://github.com/Jmurda1!/dispatcharr-h2-hls-bridge",
+  "fields": [
+    {
+      "id": "listen_host",
+      "label": "Listen host",
+      "type": "string",
+      "default": "0.0.0.0"
+    },
+    {
+      "id": "listen_port",
+      "label": "Listen port",
+      "type": "number",
+      "default": 8765
+    },
+    {
+      "id": "upstream_url",
+      "label": "Upstream HLS URL",
+      "type": "string",
+      "default": ""
+    },
+    {
+      "id": "referer",
+      "label": "Referer",
+      "type": "string",
+      "default": "https://tvnow.st/"
+    },
+    {
+      "id": "origin",
+      "label": "Origin",
+      "type": "string",
+      "default": "https://tvnow.st/"
+    },
+    {
+      "id": "user_agent",
+      "label": "User-Agent",
+      "type": "string",
+      "default": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/111.0.0.0 Safari/537.36"
+    }
+  ],
+  "actions": [
+    {
+      "id": "start",
+      "label": "Start bridge",
+      "button_label": "Start"
+    },
+    {
+      "id": "stop",
+      "label": "Stop bridge",
+      "button_label": "Stop"
+    }
+  ]
+}
